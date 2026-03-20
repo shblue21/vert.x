@@ -58,6 +58,7 @@ import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.*;
+import io.vertx.core.http.impl.HttpServerRequestImpl;
 import io.vertx.core.internal.buffer.BufferInternal;
 import io.vertx.core.http.impl.tcp.Http1xOrH2CHandler;
 import io.vertx.core.http.impl.HttpUtils;
@@ -122,6 +123,17 @@ public class Http2ServerTest extends Http2TestBase {
 
   private static Http2Headers POST(String path) {
     return headers("POST", "https", path);
+  }
+
+  private boolean hasMultipartDecoder(HttpServerRequest request) {
+    if (request instanceof HttpServerRequestImpl) {
+      return ((HttpServerRequestImpl) request).hasMultipartDecoder();
+    }
+    throw new AssertionError("Cannot inspect multipart decoder on " + request.getClass());
+  }
+
+  private void assertMultipartDecoderDestroyed(HttpServerRequest request) {
+    assertFalse(hasMultipartDecoder(request));
   }
 
   class TestClient {
@@ -703,6 +715,70 @@ public class Http2ServerTest extends Http2TestBase {
       request.encoder.writeData(request.context, id, BufferInternal.buffer(body).getByteBuf(), 0, true, request.context.newPromise());
       request.context.flush();
     });
+    await();
+  }
+
+  @Test
+  public void testMultipartDecoderCleanupOnClientResetStream() throws Exception {
+    Context ctx = vertx.getOrCreateContext();
+    Promise<Void> uploadReceived = Promise.promise();
+    AtomicBoolean completed = new AtomicBoolean();
+    AtomicBoolean reset = new AtomicBoolean();
+    server.requestHandler(req -> {
+      assertOnIOContext(ctx);
+      req.setExpectMultipart(true);
+      assertTrue(hasMultipartDecoder(req));
+      req.uploadHandler(upload -> {
+        assertOnIOContext(ctx);
+        assertTrue(hasMultipartDecoder(req));
+        upload.handler(buffer -> {
+        });
+        upload.endHandler(v -> {
+          fail();
+        });
+        uploadReceived.tryComplete();
+      });
+      req.exceptionHandler(err -> {
+        assertOnIOContext(ctx);
+        assertMultipartDecoderDestroyed(req);
+        if (completed.get()) {
+          return;
+        }
+        if (err instanceof StreamResetException) {
+          assertEquals(Http2Error.CANCEL.code(), ((StreamResetException) err).getCode());
+          assertTrue(reset.compareAndSet(false, true));
+          completed.set(true);
+          testComplete();
+        } else if (!(err instanceof HttpClosedException)) {
+          fail();
+        }
+      });
+      req.endHandler(v -> {
+        fail();
+      });
+    });
+    startServer(ctx);
+
+    String boundary = "dLV9Wyq26L_-JQxk6ferf-RT153LhOO";
+    String partial = "--" + boundary + "\r\n" +
+      "Content-Disposition: form-data; name=\"file\"; filename=\"tmp-0.txt\"\r\n" +
+      "Content-Type: image/gif\r\n" +
+      "\r\n" +
+      "AAAAAA";
+
+    TestClient client = new TestClient();
+    client.connect(DEFAULT_HTTPS_PORT, DEFAULT_HTTPS_HOST, request -> {
+      int id = request.nextStreamId();
+      Http2ConnectionEncoder encoder = request.encoder;
+      encoder.writeHeaders(request.context, id, POST("/form").set(HttpHeaderNames.CONTENT_TYPE, "multipart/form-data; boundary=" + boundary), 0, false, request.context.newPromise());
+      encoder.writeData(request.context, id, BufferInternal.buffer(partial).getByteBuf(), 0, false, request.context.newPromise());
+      uploadReceived.future().onComplete(onSuccess(v -> {
+        encoder.writeRstStream(request.context, id, Http2Error.CANCEL.code(), request.context.newPromise());
+        request.context.flush();
+      }));
+      request.context.flush();
+    });
+
     await();
   }
 

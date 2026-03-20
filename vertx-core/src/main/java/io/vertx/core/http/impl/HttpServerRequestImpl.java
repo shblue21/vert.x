@@ -140,35 +140,40 @@ public class HttpServerRequestImpl extends HttpServerRequestInternal {
   }
 
   private void handleException(Throwable cause) {
-    boolean notify;
+    InterfaceHttpData upload = null;
+    HttpEventHandler handler = null;
     synchronized (connection) {
-      notify = !ended;
+      if (!ended) {
+        upload = destroyDecoder();
+        handler = eventHandler;
+      } else {
+        destroyDecoder();
+      }
     }
-    if (notify) {
-      notifyException(cause);
+    if (handler != null) {
+      handler.handleException(cause);
+    }
+    if (upload instanceof NettyFileUpload) {
+      ((NettyFileUpload) upload).handleException(cause);
     }
     response.handleException(cause);
   }
 
   private void handleClosed(Void v) {
+    synchronized (connection) {
+      destroyDecoder();
+    }
     response.handleClose(v);
   }
 
-  private void notifyException(Throwable failure) {
-    InterfaceHttpData upload = null;
-    HttpEventHandler handler;
-    synchronized (connection) {
-      if (postRequestDecoder != null) {
-        upload = postRequestDecoder.currentPartialHttpData();
-      }
-      handler = eventHandler;
+  private InterfaceHttpData destroyDecoder() {
+    if (postRequestDecoder != null) {
+      InterfaceHttpData upload = postRequestDecoder.currentPartialHttpData();
+      postRequestDecoder.destroy();
+      postRequestDecoder = null;
+      return upload;
     }
-    if (handler != null) {
-      handler.handleException(failure);
-    }
-    if (upload instanceof NettyFileUpload) {
-      ((NettyFileUpload)upload).handleException(failure);
-    }
+    return null;
   }
 
   public void handleData(Buffer data) {
@@ -178,8 +183,9 @@ public class HttpServerRequestImpl extends HttpServerRequestInternal {
       } catch (HttpPostRequestDecoder.ErrorDataDecoderException |
                HttpPostRequestDecoder.TooLongFormFieldException |
                HttpPostRequestDecoder.TooManyFormFieldsException e) {
-        postRequestDecoder.destroy();
-        postRequestDecoder = null;
+        synchronized (connection) {
+          destroyDecoder();
+        }
         handleException(e);
       }
     }
@@ -194,9 +200,10 @@ public class HttpServerRequestImpl extends HttpServerRequestInternal {
     synchronized (connection) {
       ended = true;
       if (postRequestDecoder != null) {
+        Throwable failure = null;
         try {
           postRequestDecoder.offer(LastHttpContent.EMPTY_LAST_CONTENT);
-          while (postRequestDecoder.hasNext()) {
+          while (failure == null && postRequestDecoder.hasNext()) {
             InterfaceHttpData data = postRequestDecoder.next();
             if (data instanceof Attribute) {
               Attribute attr = (Attribute) data;
@@ -204,19 +211,21 @@ public class HttpServerRequestImpl extends HttpServerRequestInternal {
                 formAttributes().add(attr.getName(), attr.getValue());
               } catch (Exception e) {
                 // Will never happen, anyway handle it somehow just in case
-                handleException(e);
+                failure = e;
               } finally {
                 attr.release();
               }
             }
+          }
+          if (failure != null) {
+            handleException(failure);
           }
         } catch (HttpPostRequestDecoder.EndOfDataDecoderException e) {
           // ignore this as it is expected
         } catch (Exception e) {
           handleException(e);
         } finally {
-          postRequestDecoder.destroy();
-          postRequestDecoder = null;
+          destroyDecoder();
         }
       }
       handler = eventHandler;
@@ -227,12 +236,22 @@ public class HttpServerRequestImpl extends HttpServerRequestInternal {
   }
 
   public void handleReset(long errorCode) {
-    boolean notify;
+    StreamResetException cause = new StreamResetException(errorCode);
+    InterfaceHttpData upload = null;
+    HttpEventHandler handler = null;
     synchronized (connection) {
-      notify = !ended;
+      if (!ended) {
+        upload = destroyDecoder();
+        handler = eventHandler;
+      } else {
+        destroyDecoder();
+      }
     }
-    if (notify) {
-      notifyException(new StreamResetException(errorCode));
+    if (handler != null) {
+      handler.handleException(cause);
+    }
+    if (upload instanceof NettyFileUpload) {
+      ((NettyFileUpload) upload).handleException(cause);
     }
     response.handleReset(errorCode);
   }
@@ -454,7 +473,7 @@ public class HttpServerRequestImpl extends HttpServerRequestInternal {
           postRequestDecoder = new HttpPostRequestDecoder(factory, req, HttpConstants.DEFAULT_CHARSET, maxFormFields, maxFormBufferedBytes);
         }
       } else {
-        postRequestDecoder = null;
+        destroyDecoder();
       }
     }
     return this;
@@ -464,6 +483,12 @@ public class HttpServerRequestImpl extends HttpServerRequestInternal {
   public boolean isExpectMultipart() {
     synchronized (connection) {
       return expectMultipart;
+    }
+  }
+
+  public boolean hasMultipartDecoder() {
+    synchronized (connection) {
+      return postRequestDecoder != null;
     }
   }
 

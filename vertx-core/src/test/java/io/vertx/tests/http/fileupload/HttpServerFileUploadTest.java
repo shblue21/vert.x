@@ -15,6 +15,8 @@ import io.vertx.core.*;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.file.AsyncFile;
 import io.vertx.core.http.*;
+import io.vertx.core.http.impl.HttpServerRequestImpl;
+import io.vertx.core.http.impl.http1.Http1ServerRequest;
 import io.vertx.core.internal.ContextInternal;
 import io.vertx.core.streams.WriteStream;
 import io.vertx.test.core.TestUtils;
@@ -32,6 +34,7 @@ import java.net.URLEncoder;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -223,6 +226,106 @@ public abstract class HttpServerFileUploadTest extends SimpleHttpTest {
   @Test
   public void testCancelFormUploadLargeFileStreamToDisk() {
     testFormUploadFile(TestUtils.randomAlphaString(4 * 1024 * 1024), false, true, false, true);
+  }
+
+  @Test
+  public void testDisableMultipartDestroysDecoder() throws Exception {
+    server.requestHandler(req -> {
+      assertEquals(HttpMethod.POST, req.method());
+      assertEquals("/form", req.path());
+      req.setExpectMultipart(true);
+      assertTrue(req.isExpectMultipart());
+      assertTrue(hasMultipartDecoder(req));
+      req.setExpectMultipart(false);
+      assertFalse(req.isExpectMultipart());
+      assertMultipartDecoderDestroyed(req);
+      req.response().end();
+    });
+    startServer(testAddress);
+
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.POST).setURI("/form"))
+      .compose(req -> req.putHeader(HttpHeaders.CONTENT_TYPE, "multipart/form-data; boundary=dLV9Wyq26L_-JQxk6ferf-RT153LhOO")
+        .putHeader(HttpHeaders.CONTENT_LENGTH, "0")
+        .send())
+      .onComplete(onSuccess(resp -> {
+        assertEquals(200, resp.statusCode());
+        testComplete();
+      }));
+
+    await();
+  }
+
+  @Test
+  public void testMultipartDecoderCleanupOnPrematureConnectionClose() throws Exception {
+    AtomicReference<HttpConnection> clientConn = new AtomicReference<>();
+    AtomicReference<HttpConnection> serverConn = new AtomicReference<>();
+    AtomicBoolean closed = new AtomicBoolean();
+    AtomicBoolean completed = new AtomicBoolean();
+    Runnable checkClose = () -> {
+      if (clientConn.get() != null && serverConn.get() != null && closed.compareAndSet(false, true)) {
+        clientConn.get().close();
+      }
+    };
+
+    server.requestHandler(req -> {
+      assertEquals(HttpMethod.POST, req.method());
+      assertEquals("/form", req.path());
+      req.setExpectMultipart(true);
+      assertTrue(hasMultipartDecoder(req));
+      req.exceptionHandler(err -> {
+        if (completed.compareAndSet(false, true)) {
+          assertMultipartDecoderDestroyed(req);
+          testComplete();
+        }
+      });
+      req.endHandler(v -> {
+        fail();
+      });
+      req.uploadHandler(upload -> {
+        assertTrue(hasMultipartDecoder(req));
+        serverConn.set(req.connection());
+        checkClose.run();
+        upload.handler(buffer -> {
+        });
+        upload.endHandler(v -> {
+          fail();
+        });
+      });
+    });
+    startServer(testAddress);
+
+    HttpClientRequest request = client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.POST).setURI("/form")).await();
+    request.exceptionHandler(err -> {
+    });
+    String boundary = "dLV9Wyq26L_-JQxk6ferf-RT153LhOO";
+    String partial = "--" + boundary + "\r\n" +
+      "Content-Disposition: form-data; name=\"file\"; filename=\"tmp-0.txt\"\r\n" +
+      "Content-Type: image/gif\r\n" +
+      "\r\n" +
+      "AAAAAA";
+    String epilogue = "\r\n--" + boundary + "--\r\n";
+    request.putHeader(HttpHeaders.CONTENT_TYPE, "multipart/form-data; boundary=" + boundary);
+    request.putHeader(HttpHeaders.CONTENT_LENGTH, Integer.toString(partial.length() + epilogue.length()));
+    request.write(partial).onComplete(onSuccess(v -> {
+      clientConn.set(request.connection());
+      checkClose.run();
+    }));
+
+    await();
+  }
+
+  private boolean hasMultipartDecoder(HttpServerRequest request) {
+    if (request instanceof Http1ServerRequest) {
+      return ((Http1ServerRequest) request).hasMultipartDecoder();
+    }
+    if (request instanceof HttpServerRequestImpl) {
+      return ((HttpServerRequestImpl) request).hasMultipartDecoder();
+    }
+    throw new AssertionError("Cannot inspect multipart decoder on " + request.getClass());
+  }
+
+  private void assertMultipartDecoderDestroyed(HttpServerRequest request) {
+    assertFalse(hasMultipartDecoder(request));
   }
 
   private void testFormUploadFile(String contentStr, boolean includeLength, boolean streamToDisk, boolean abortClient, boolean cancelStream) {
@@ -606,11 +709,27 @@ public abstract class HttpServerFileUploadTest extends SimpleHttpTest {
     server.requestHandler(req -> {
       req.setExpectMultipart(true);
       AtomicInteger errCount = new AtomicInteger();
+      AtomicInteger uploadErrCount = new AtomicInteger();
+      AtomicBoolean uploadCreated = new AtomicBoolean();
       req.exceptionHandler(err -> {
         errCount.incrementAndGet();
       });
+      req.uploadHandler(upload -> {
+        uploadCreated.set(true);
+        upload.exceptionHandler(err -> {
+          uploadErrCount.incrementAndGet();
+        });
+        upload.handler(buffer -> {
+        });
+        upload.endHandler(v -> {
+          fail();
+        });
+      });
       req.endHandler(v -> {
-        assertTrue(errCount.get() > 0);
+        assertEquals(1, errCount.get());
+        if (uploadCreated.get()) {
+          assertEquals(0, uploadErrCount.get());
+        }
         testComplete();
       });
     });

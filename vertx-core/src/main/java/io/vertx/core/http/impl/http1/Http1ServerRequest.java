@@ -517,7 +517,7 @@ public class Http1ServerRequest extends HttpServerRequestInternal implements io.
           decoder = new HttpPostRequestDecoder(factory, request, HttpConstants.DEFAULT_CHARSET, maxFields, maxBufferedBytes);
         }
       } else {
-        decoder = null;
+        destroyDecoder();
       }
       return this;
     }
@@ -526,6 +526,10 @@ public class Http1ServerRequest extends HttpServerRequestInternal implements io.
   @Override
   public synchronized boolean isExpectMultipart() {
     return expectMultipart;
+  }
+
+  public synchronized boolean hasMultipartDecoder() {
+    return decoder != null;
   }
 
   @Override
@@ -567,8 +571,7 @@ public class Http1ServerRequest extends HttpServerRequestInternal implements io.
         } catch (HttpPostRequestDecoder.ErrorDataDecoderException |
                  HttpPostRequestDecoder.TooLongFormFieldException |
                  HttpPostRequestDecoder.TooManyFormFieldsException e) {
-          decoder.destroy();
-          decoder = null;
+          destroyDecoder();
           handleException(e);
         }
       }
@@ -617,9 +620,10 @@ public class Http1ServerRequest extends HttpServerRequestInternal implements io.
   }
 
   private void endDecode() {
+    Throwable failure = null;
     try {
       decoder.offer(LastHttpContent.EMPTY_LAST_CONTENT);
-      while (decoder.hasNext()) {
+      while (failure == null && decoder.hasNext()) {
         InterfaceHttpData data = decoder.next();
         if (data instanceof Attribute) {
           Attribute attr = (Attribute) data;
@@ -627,11 +631,14 @@ public class Http1ServerRequest extends HttpServerRequestInternal implements io.
             attributes().add(attr.getName(), attr.getValue());
           } catch (Exception e) {
             // Will never happen, anyway handle it somehow just in case
-            handleException(e);
+            failure = e;
           } finally {
             attr.release();
           }
         }
+      }
+      if (failure != null) {
+        handleException(failure);
       }
     } catch (HttpPostRequestDecoder.ErrorDataDecoderException |
              HttpPostRequestDecoder.TooLongFormFieldException |
@@ -640,9 +647,18 @@ public class Http1ServerRequest extends HttpServerRequestInternal implements io.
     }  catch (HttpPostRequestDecoder.EndOfDataDecoderException e) {
       // ignore this as it is expected
     } finally {
+      destroyDecoder();
+    }
+  }
+
+  private InterfaceHttpData destroyDecoder() {
+    if (decoder != null) {
+      InterfaceHttpData upload = decoder.currentPartialHttpData();
       decoder.destroy();
       decoder = null;
+      return upload;
     }
+    return null;
   }
 
   void handleException(Throwable t) {
@@ -650,11 +666,11 @@ public class Http1ServerRequest extends HttpServerRequestInternal implements io.
     Http1ServerResponse resp = null;
     InterfaceHttpData upload = null;
     synchronized (conn) {
-      if (!isEnded()) {
+      if (!ended) {
         handler = eventHandler;
-        if (decoder != null) {
-          upload = decoder.currentPartialHttpData();
-        }
+        upload = destroyDecoder();
+      } else {
+        destroyDecoder();
       }
       if (!response.ended()) {
         if (METRICS_ENABLED) {

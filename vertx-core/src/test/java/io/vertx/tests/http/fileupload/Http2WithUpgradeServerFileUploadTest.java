@@ -13,6 +13,8 @@ package io.vertx.tests.http.fileupload;
 import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.http.HttpVersion;
 import io.vertx.test.http.HttpConfig;
+import org.junit.Ignore;
+import org.junit.Test;
 
 /**
  */
@@ -27,5 +29,12 @@ public class Http2WithUpgradeServerFileUploadTest extends HttpServerFileUploadTe
           .setHttp2ClearTextUpgrade(true);
       }
     });
+  }
+
+  @Override
+  @Test
+  @Ignore("Clear-text upgrade requires ending the request before the upgrade succeeds")
+  public void testMultipartDecoderCleanupOnPrematureConnectionClose() throws Exception {
+    super.testMultipartDecoderCleanupOnPrematureConnectionClose();
   }
 }
