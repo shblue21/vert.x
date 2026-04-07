@@ -628,6 +628,7 @@ public class Http1ServerRequest extends HttpServerRequestInternal implements io.
           } catch (Exception e) {
             // Will never happen, anyway handle it somehow just in case
             handleException(e);
+            return;
           } finally {
             attr.release();
           }
@@ -640,8 +641,7 @@ public class Http1ServerRequest extends HttpServerRequestInternal implements io.
     }  catch (HttpPostRequestDecoder.EndOfDataDecoderException e) {
       // ignore this as it is expected
     } finally {
-      decoder.destroy();
-      decoder = null;
+      cleanupDecoder();
     }
   }
 
@@ -649,11 +649,13 @@ public class Http1ServerRequest extends HttpServerRequestInternal implements io.
     HttpEventHandler handler = null;
     Http1ServerResponse resp = null;
     InterfaceHttpData upload = null;
+    boolean cleanupDecoder = false;
     synchronized (conn) {
       if (!isEnded()) {
         handler = eventHandler;
         if (decoder != null) {
           upload = decoder.currentPartialHttpData();
+          cleanupDecoder = true;
         }
       }
       if (!response.ended()) {
@@ -663,14 +665,29 @@ public class Http1ServerRequest extends HttpServerRequestInternal implements io.
         resp = response;
       }
     }
-    if (resp != null) {
-      resp.handleException(t);
+    try {
+      if (resp != null) {
+        resp.handleException(t);
+      }
+      if (upload instanceof NettyFileUpload) {
+        ((NettyFileUpload) upload).handleException(t);
+      }
+      if (handler != null) {
+        handler.handleException(t);
+      }
+    } finally {
+      if (cleanupDecoder) {
+        cleanupDecoder();
+      }
     }
-    if (upload instanceof NettyFileUpload) {
-      ((NettyFileUpload) upload).handleException(t);
-    }
-    if (handler != null) {
-      handler.handleException(t);
+  }
+
+  private void cleanupDecoder() {
+    synchronized (conn) {
+      if (decoder != null) {
+        decoder.destroy();
+        decoder = null;
+      }
     }
   }
 

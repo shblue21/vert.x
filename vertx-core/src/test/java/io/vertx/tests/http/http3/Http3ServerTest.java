@@ -17,7 +17,6 @@ import io.netty.handler.codec.quic.QuicStreamResetException;
 import io.netty.util.NetUtil;
 import io.vertx.core.Context;
 import io.vertx.core.Future;
-import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.*;
 import io.vertx.core.internal.VertxInternal;
@@ -26,6 +25,7 @@ import io.vertx.core.net.QuicServer;
 import io.vertx.core.net.QuicStream;
 import io.vertx.core.net.ServerSSLOptions;
 import io.vertx.core.net.SocketAddress;
+import io.vertx.tests.http.MultipartDecoderTestSupport;
 import io.vertx.test.core.VertxTestBase;
 import io.vertx.test.tls.Cert;
 import io.vertx.test.core.TestUtils;
@@ -45,6 +45,8 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.netty.handler.codec.http3.Http3ErrorCode.H3_REQUEST_CANCELLED;
@@ -375,6 +377,125 @@ public class Http3ServerTest extends VertxTestBase {
   }
 
   @Test
+  public void testMultipartResetCleansDecoderAfterNotifications() throws Exception {
+    CountDownLatch latch = new CountDownLatch(1);
+    AtomicBoolean completed = new AtomicBoolean();
+    String boundary = "vertx-http3-boundary";
+
+    server.requestHandler(req -> {
+      Assert.assertEquals("io.vertx.core.http.impl.HttpServerRequestImpl", req.getClass().getName());
+      req.setExpectMultipart(true);
+      req.uploadHandler(upload -> latch.countDown());
+      req.exceptionHandler(err -> {
+        if (completed.compareAndSet(false, true)) {
+          Assert.assertNotNull(MultipartDecoderTestSupport.fieldValue(req, "postRequestDecoder"));
+          MultipartDecoderTestSupport.assertFieldClearedNextTick(req, "postRequestDecoder", () -> {
+            testComplete();
+          });
+        }
+      });
+      req.endHandler(v -> Assert.fail("Should not end on reset multipart upload"));
+    });
+
+    server.listen(8443, "localhost").await();
+
+    Http3TestClient.Client.Connection connection = client.connect(new InetSocketAddress(NetUtil.LOCALHOST4, 8443));
+    Http3TestClient.Client.Stream stream = connection.stream();
+    stream.write(new DefaultHttp3Headers()
+      .method("POST")
+      .path("/form")
+      .set(HttpHeaders.CONTENT_TYPE.toString(), MultipartDecoderTestSupport.multipartContentType(boundary))
+      .set(HttpHeaders.CONTENT_LENGTH.toString(), "512"));
+    stream.write(MultipartDecoderTestSupport.partialMultipartBody(boundary).getBytes(StandardCharsets.UTF_8));
+
+    TestUtils.awaitLatch(latch);
+    stream.reset(4);
+
+    try {
+      stream.responseBody();
+      Assert.fail();
+    } catch (QuicStreamResetException e) {
+      Assert.assertEquals(Http3ErrorCode.H3_REQUEST_INCOMPLETE.code(), e.applicationProtocolCode());
+    }
+
+    await();
+  }
+
+  @Test
+  public void testMultipartParserErrorCleansDecoderBeforeNotifications() throws Exception {
+    AtomicInteger errCount = new AtomicInteger();
+    String boundary = "vertx-http3-boundary";
+
+    server.requestHandler(req -> {
+      req.setExpectMultipart(true);
+      req.exceptionHandler(err -> {
+        errCount.incrementAndGet();
+        Assert.assertNull(MultipartDecoderTestSupport.fieldValue(req, "postRequestDecoder"));
+      });
+      req.endHandler(v -> {
+        Assert.assertTrue(errCount.get() > 0);
+        Assert.assertNull(MultipartDecoderTestSupport.fieldValue(req, "postRequestDecoder"));
+        testComplete();
+      });
+    });
+
+    server.listen(8443, "localhost").await();
+
+    String body = MultipartDecoderTestSupport.invalidMultipartBody(boundary);
+    Http3TestClient.Client.Connection connection = client.connect(new InetSocketAddress(NetUtil.LOCALHOST4, 8443));
+    Http3TestClient.Client.Stream stream = connection.stream();
+    stream.write(new DefaultHttp3Headers()
+      .method("POST")
+      .path("/form")
+      .set(HttpHeaders.CONTENT_TYPE.toString(), MultipartDecoderTestSupport.multipartContentType(boundary))
+      .set(HttpHeaders.CONTENT_LENGTH.toString(), Integer.toString(body.length())));
+    stream.end(body.getBytes(StandardCharsets.UTF_8));
+
+    await();
+  }
+
+  @Test
+  public void testMultipartCloseCleansDecoderAfterNotifications() throws Exception {
+    CountDownLatch responseStarted = new CountDownLatch(1);
+    AtomicBoolean completed = new AtomicBoolean();
+    AtomicBoolean requestExceptionSeen = new AtomicBoolean();
+    String boundary = "vertx-http3-boundary";
+
+    server.requestHandler(req -> {
+      Assert.assertEquals("io.vertx.core.http.impl.HttpServerRequestImpl", req.getClass().getName());
+      req.setExpectMultipart(true);
+      req.uploadHandler(upload -> req.response().end("chunk").onComplete(TestUtils.onSuccess(v -> responseStarted.countDown())));
+      req.exceptionHandler(err -> requestExceptionSeen.set(true));
+      req.response().closeHandler(v -> {
+        if (completed.compareAndSet(false, true)) {
+          Assert.assertFalse("Expected multipart close path without request exception", requestExceptionSeen.get());
+          Assert.assertNotNull(MultipartDecoderTestSupport.fieldValue(req, "postRequestDecoder"));
+          MultipartDecoderTestSupport.assertFieldClearedNextTick(req, "postRequestDecoder", () -> {
+            testComplete();
+          });
+        }
+      });
+      req.endHandler(v -> Assert.fail("Should not end on closed multipart upload"));
+    });
+
+    server.listen(8443, "localhost").await();
+
+    Http3TestClient.Client.Connection connection = client.connect(new InetSocketAddress(NetUtil.LOCALHOST4, 8443));
+    Http3TestClient.Client.Stream stream = connection.stream();
+    stream.write(new DefaultHttp3Headers()
+      .method("POST")
+      .path("/form")
+      .set(HttpHeaders.CONTENT_TYPE.toString(), MultipartDecoderTestSupport.multipartContentType(boundary))
+      .set(HttpHeaders.CONTENT_LENGTH.toString(), "512"));
+    stream.write(MultipartDecoderTestSupport.partialMultipartBody(boundary).getBytes(StandardCharsets.UTF_8));
+
+    TestUtils.awaitLatch(responseStarted);
+    connection.close();
+
+    await();
+  }
+
+  @Test
   public void testStreamIdleTimeout() throws Exception {
 
     HttpServerConfig config = serverConfig();
@@ -542,4 +663,5 @@ public class Http3ServerTest extends VertxTestBase {
 //      logs(Http3FrameLogger.class).
 //      filter(record -> record.getMessage().contains("GO_AWAY")).count());
 //  }
+
 }

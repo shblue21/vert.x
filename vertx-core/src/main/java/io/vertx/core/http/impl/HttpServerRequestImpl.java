@@ -71,6 +71,8 @@ public class HttpServerRequestImpl extends HttpServerRequestInternal {
   private Handler<HttpServerFileUpload> uploadHandler;
   private boolean expectMultipart;
   private HttpPostRequestDecoder postRequestDecoder;
+  private boolean decoderCleanupPending;
+  private boolean decoderCleanupScheduled;
 
   public HttpServerRequestImpl(Handler<HttpServerRequest> handler,
                                HttpServerStream stream,
@@ -141,8 +143,16 @@ public class HttpServerRequestImpl extends HttpServerRequestInternal {
 
   private void handleException(Throwable cause) {
     boolean notify;
+    boolean deferCleanup;
     synchronized (connection) {
       notify = !ended;
+      deferCleanup = notify && postRequestDecoder != null;
+      if (deferCleanup) {
+        decoderCleanupPending = true;
+      }
+    }
+    if (deferCleanup) {
+      scheduleDecoderCleanupAfterException();
     }
     if (notify) {
       notifyException(cause);
@@ -151,7 +161,17 @@ public class HttpServerRequestImpl extends HttpServerRequestInternal {
   }
 
   private void handleClosed(Void v) {
-    response.handleClose(v);
+    boolean cleanupDecoder;
+    synchronized (connection) {
+      cleanupDecoder = postRequestDecoder != null || decoderCleanupPending;
+    }
+    try {
+      response.handleClose(v);
+    } finally {
+      if (cleanupDecoder) {
+        cleanupDecoderNow();
+      }
+    }
   }
 
   private void notifyException(Throwable failure) {
@@ -228,13 +248,45 @@ public class HttpServerRequestImpl extends HttpServerRequestInternal {
 
   public void handleReset(long errorCode) {
     boolean notify;
+    boolean cleanupDecoder;
     synchronized (connection) {
       notify = !ended;
+      cleanupDecoder = notify && postRequestDecoder != null;
     }
-    if (notify) {
-      notifyException(new StreamResetException(errorCode));
+    try {
+      if (notify) {
+        notifyException(new StreamResetException(errorCode));
+      }
+      response.handleReset(errorCode);
+    } finally {
+      if (cleanupDecoder) {
+        cleanupDecoderNow();
+      }
     }
-    response.handleReset(errorCode);
+  }
+
+  private void scheduleDecoderCleanupAfterException() {
+    boolean schedule;
+    synchronized (connection) {
+      schedule = decoderCleanupPending && !decoderCleanupScheduled;
+      if (schedule) {
+        decoderCleanupScheduled = true;
+      }
+    }
+    if (schedule) {
+      context.runOnContext(v -> cleanupDecoderNow());
+    }
+  }
+
+  private void cleanupDecoderNow() {
+    synchronized (connection) {
+      decoderCleanupPending = false;
+      decoderCleanupScheduled = false;
+      if (postRequestDecoder != null) {
+        postRequestDecoder.destroy();
+        postRequestDecoder = null;
+      }
+    }
   }
 
   private void checkEnded() {
