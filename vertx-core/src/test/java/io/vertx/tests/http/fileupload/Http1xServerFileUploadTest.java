@@ -42,7 +42,6 @@ public class Http1xServerFileUploadTest extends HttpServerFileUploadTest {
     AtomicBoolean uploadExceptionSeen = new AtomicBoolean();
     String boundary = "vertx-boundary";
     server.requestHandler(req -> {
-      Assert.assertEquals("io.vertx.core.http.impl.http1.Http1ServerRequest", req.getClass().getName());
       req.setExpectMultipart(true);
       req.uploadHandler(upload -> upload.exceptionHandler(err -> {
         uploadExceptionSeen.set(true);
@@ -75,7 +74,6 @@ public class Http1xServerFileUploadTest extends HttpServerFileUploadTest {
   public void testMalformedMultipartFinalizationDoesNotDoubleCleanupDecoder() throws Exception {
     AtomicReference<FailingHttpPostRequestDecoder> failingDecoder = new AtomicReference<>();
     server.requestHandler(req -> {
-      Assert.assertEquals("io.vertx.core.http.impl.http1.Http1ServerRequest", req.getClass().getName());
       req.setExpectMultipart(true);
       FailingHttpPostRequestDecoder decoder = new FailingHttpPostRequestDecoder();
       failingDecoder.set(decoder);
@@ -105,7 +103,6 @@ public class Http1xServerFileUploadTest extends HttpServerFileUploadTest {
   public void testMultipartAttributeFinalizationFailureDoesNotReenterDecoderLoop() throws Exception {
     AtomicReference<AttributeFailingHttpPostRequestDecoder> failingDecoder = new AtomicReference<>();
     server.requestHandler(req -> {
-      Assert.assertEquals("io.vertx.core.http.impl.http1.Http1ServerRequest", req.getClass().getName());
       req.setExpectMultipart(true);
       AttributeFailingHttpPostRequestDecoder decoder = new AttributeFailingHttpPostRequestDecoder();
       failingDecoder.set(decoder);

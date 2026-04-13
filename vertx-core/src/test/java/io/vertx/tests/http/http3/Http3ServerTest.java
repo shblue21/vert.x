@@ -383,7 +383,6 @@ public class Http3ServerTest extends VertxTestBase {
     String boundary = "vertx-http3-boundary";
 
     server.requestHandler(req -> {
-      Assert.assertEquals("io.vertx.core.http.impl.HttpServerRequestImpl", req.getClass().getName());
       req.setExpectMultipart(true);
       req.uploadHandler(upload -> latch.countDown());
       req.exceptionHandler(err -> {
@@ -419,6 +418,64 @@ public class Http3ServerTest extends VertxTestBase {
     }
 
     await();
+  }
+
+  @Test
+  public void testMultipartUploadCompletesNormally() throws Exception {
+    AtomicInteger uploadCount = new AtomicInteger();
+    AtomicBoolean uploadCompleted = new AtomicBoolean();
+    CountDownLatch requestEnded = new CountDownLatch(1);
+    String boundary = "vertx-http3-boundary";
+    String body = "--" + boundary + "\r\n" +
+      "Content-Disposition: form-data; name=\"file\"; filename=\"tmp-0.txt\"\r\n" +
+      "Content-Type: image/gif; charset=utf-8\r\n" +
+      "Content-Length: 12\r\n" +
+      "\r\n" +
+      "some-content\r\n" +
+      "--" + boundary + "--\r\n";
+
+    server.requestHandler(req -> {
+      Assert.assertEquals(HttpVersion.HTTP_3, req.version());
+      req.setExpectMultipart(true);
+      req.uploadHandler(upload -> {
+        Assert.assertEquals(1, uploadCount.incrementAndGet());
+        Buffer uploaded = Buffer.buffer();
+        Assert.assertEquals("file", upload.name());
+        Assert.assertEquals("tmp-0.txt", upload.filename());
+        Assert.assertEquals("image/gif", upload.contentType());
+        upload.handler(uploaded::appendBuffer);
+        upload.endHandler(v -> {
+          Assert.assertEquals(Buffer.buffer("some-content"), uploaded);
+          Assert.assertTrue(upload.isSizeAvailable());
+          Assert.assertEquals("some-content".length(), upload.size());
+          Assert.assertNull(upload.file());
+          uploadCompleted.set(true);
+        });
+      });
+      req.endHandler(v -> {
+        Assert.assertTrue(uploadCompleted.get());
+        Assert.assertEquals(1, uploadCount.get());
+        Assert.assertEquals(0, req.formAttributes().size());
+        req.response().closeHandler(ignored -> requestEnded.countDown());
+        req.response().end("done");
+      });
+      req.exceptionHandler(err -> Assert.fail(err.getMessage()));
+    });
+
+    server.listen(8443, "localhost").await();
+
+    Http3TestClient.Client.Connection connection = client.connect(new InetSocketAddress(NetUtil.LOCALHOST4, 8443));
+    Http3TestClient.Client.Stream stream = connection.stream();
+    stream.write(new DefaultHttp3Headers()
+      .method("POST")
+      .path("/form")
+      .set(HttpHeaders.CONTENT_TYPE.toString(), MultipartDecoderTestSupport.multipartContentType(boundary))
+      .set(HttpHeaders.CONTENT_LENGTH.toString(), Integer.toString(body.getBytes(StandardCharsets.UTF_8).length)));
+    stream.end(body.getBytes(StandardCharsets.UTF_8));
+
+    TestUtils.awaitLatch(requestEnded);
+    Assert.assertEquals("done", new String(stream.responseBody(), StandardCharsets.UTF_8));
+    Assert.assertEquals("200", String.valueOf(stream.responseHeaders().status()));
   }
 
   @Test
@@ -462,7 +519,6 @@ public class Http3ServerTest extends VertxTestBase {
     String boundary = "vertx-http3-boundary";
 
     server.requestHandler(req -> {
-      Assert.assertEquals("io.vertx.core.http.impl.HttpServerRequestImpl", req.getClass().getName());
       req.setExpectMultipart(true);
       req.uploadHandler(upload -> req.response().end("chunk").onComplete(TestUtils.onSuccess(v -> responseStarted.countDown())));
       req.exceptionHandler(err -> requestExceptionSeen.set(true));

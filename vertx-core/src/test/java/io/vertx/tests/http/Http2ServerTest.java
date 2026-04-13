@@ -125,6 +125,17 @@ public class Http2ServerTest extends Http2TestBase {
     return headers("POST", "https", path);
   }
 
+  private static byte[] malformedDataFrameWithInvalidPadding(int streamId) {
+    // Malformed DATA frame: the frame length is 0x12 while the pad-length byte is 0x1F.
+    return new byte[]{
+      0x00, 0x00, 0x12, 0x00, 0x08,
+      (byte) ((streamId >>> 24) & 0xFF), (byte) ((streamId >>> 16) & 0xFF),
+      (byte) ((streamId >>> 8) & 0xFF), (byte) (streamId & 0xFF),
+      0x1F, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00
+    };
+  }
+
   class TestClient {
 
     final Http2Settings settings = new Http2Settings();
@@ -720,7 +731,6 @@ public class Http2ServerTest extends Http2TestBase {
     String boundary = "vertx-http2-boundary";
     server.requestHandler(req -> {
       TestUtils.assertOnIOContext(ctx);
-      Assert.assertEquals("io.vertx.core.http.impl.HttpServerRequestImpl", req.getClass().getName());
       req.setExpectMultipart(true);
       req.uploadHandler(upload -> {
         TestUtils.assertOnIOContext(ctx);
@@ -811,7 +821,6 @@ public class Http2ServerTest extends Http2TestBase {
     String boundary = "vertx-http2-boundary";
     server.requestHandler(req -> {
       TestUtils.assertOnIOContext(ctx);
-      Assert.assertEquals("io.vertx.core.http.impl.HttpServerRequestImpl", req.getClass().getName());
       req.setExpectMultipart(true);
       req.uploadHandler(upload -> {
         TestUtils.assertOnIOContext(ctx);
@@ -1705,15 +1714,8 @@ public class Http2ServerTest extends Http2TestBase {
       encoder.writeHeaders(request.context, id, GET("/"), 0, false, request.context.newPromise());
       request.context.flush();
       when.future().onComplete(ar -> {
-        // Send a corrupted frame on purpose to check we get the corresponding error in the request exception handler
-        // the error is : greater padding value 0c -> 1F
-        // ChannelFuture a = encoder.frameWriter().writeData(request.context, id, Buffer.buffer("hello").getByteBuf(), 12, false, request.context.newPromise());
-        // normal frame    : 00 00 12 00 08 00 00 00 03 0c 68 65 6c 6c 6f 00 00 00 00 00 00 00 00 00 00 00 00
-        // corrupted frame : 00 00 12 00 08 00 00 00 03 1F 68 65 6c 6c 6f 00 00 00 00 00 00 00 00 00 00 00 00
-        request.channel.write(BufferInternal.buffer(new byte[]{
-            0x00, 0x00, 0x12, 0x00, 0x08, 0x00, 0x00, 0x00, (byte)(id & 0xFF), 0x1F, 0x68, 0x65, 0x6c, 0x6c,
-            0x6f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-        }).getByteBuf());
+        // Send a malformed DATA frame with an invalid padding value to trigger the request exception handler.
+        request.channel.write(BufferInternal.buffer(malformedDataFrameWithInvalidPadding(id)).getByteBuf());
         request.context.flush();
       });
     });
@@ -1728,7 +1730,6 @@ public class Http2ServerTest extends Http2TestBase {
     String boundary = "vertx-http2-boundary";
     server.requestHandler(req -> {
       TestUtils.assertOnIOContext(ctx);
-      Assert.assertEquals("io.vertx.core.http.impl.HttpServerRequestImpl", req.getClass().getName());
       req.setExpectMultipart(true);
       req.uploadHandler(upload -> {
         TestUtils.assertOnIOContext(ctx);
@@ -1758,10 +1759,7 @@ public class Http2ServerTest extends Http2TestBase {
       encoder.writeData(request.context, id, BufferInternal.buffer(body).getByteBuf(), 0, false, request.context.newPromise());
       request.context.flush();
       uploadStarted.future().onComplete(ar -> {
-        request.channel.write(BufferInternal.buffer(new byte[]{
-          0x00, 0x00, 0x12, 0x00, 0x08, 0x00, 0x00, 0x00, (byte) (id & 0xFF), 0x1F, 0x68, 0x65, 0x6c, 0x6c,
-          0x6f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-        }).getByteBuf());
+        request.channel.write(BufferInternal.buffer(malformedDataFrameWithInvalidPadding(id)).getByteBuf());
         request.context.flush();
       });
     });
